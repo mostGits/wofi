@@ -29,6 +29,7 @@ sources = ['src/config.c',
 			'src/utils.c',
 			'src/widget_builder.c',
 			'src/wofi.c',
+			'src/calc.c',
 			'proto/wlr-layer-shell-unstable-v1-protocol.c',
 			'proto/xdg-output-unstable-v1-protocol.c',
 			'proto/xdg-shell-protocol.c']

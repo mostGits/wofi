@@ -17,6 +17,8 @@
 
 #include <wofi.h>
 
+#include <calc.h>
+
 #include <ctype.h>
 #if defined(__GLIBC__) && (__GLIBC__ <= 2 && __GLIBC_MINOR__ <= 35)
 # define __USE_GNU
@@ -140,12 +142,9 @@ static struct zwlr_layer_surface_v1* wlr_surface;
 //Most
 static void widget_allocate(GtkWidget* widget, GdkRectangle* allocation, gpointer data);
 static void update_calc_row(const char* input);
-static bool calc_input_is_expression(const char* text);
 static bool is_calc_box(GtkWidget* widget);
 static void copy_text_to_clipboard(const gchar* text);
 
-static bool calc_input_is_expression(const char* text);
-static bool calc_eval_expression(const char* text, double* out);
 //
 struct output_node {
 	char* name;
@@ -626,127 +625,6 @@ static GtkWidget* create_label(char* mode, char* text, char* search_text, char* 
 	return box;
 }
 //Most
-struct calc_parser {
-        const char* s;
-};
-
-static void calc_skip_spaces(struct calc_parser* p) {
-        while(*p->s == ' ' || *p->s == '\t' || *p->s == '\n') {
-                ++p->s;
-        }
-}
-
-static double calc_parse_expr(struct calc_parser* p, bool* ok);
-
-static double calc_parse_number(struct calc_parser* p, bool* ok) {
-        calc_skip_spaces(p);
-
-        char* end = NULL;
-        double value = strtod(p->s, &end);
-
-        if(end == p->s) {
-                *ok = false;
-                return 0.0;
-        }
-
-        p->s = end;
-        return value;
-}
-
-static double calc_parse_factor(struct calc_parser* p, bool* ok) {
-        calc_skip_spaces(p);
-
-        if(*p->s == '(') {
-                ++p->s;
-                double value = calc_parse_expr(p, ok);
-                calc_skip_spaces(p);
-
-                if(*p->s != ')') {
-                        *ok = false;
-                        return 0.0;
-                }
-
-                ++p->s;
-                return value;
-        }
-
-        if(*p->s == '-') {
-                ++p->s;
-                return -calc_parse_factor(p, ok);
-        }
-
-        return calc_parse_number(p, ok);
-}
-
-static double calc_parse_term(struct calc_parser* p, bool* ok) {
-        double value = calc_parse_factor(p, ok);
-
-        while(*ok) {
-                calc_skip_spaces(p);
-
-                if(*p->s == '*') {
-                        ++p->s;
-                        value *= calc_parse_factor(p, ok);
-                } else if(*p->s == '/') {
-                        ++p->s;
-                        double rhs = calc_parse_factor(p, ok);
-                        if(!*ok) {
-                                return 0.0;
-                        }
-                        if(rhs == 0.0) {
-                                *ok = false;
-                                return 0.0;
-                        }
-                        value /= rhs;
-                } else {
-                        break;
-                }
-        }
-
-        return value;
-}
-
-static double calc_parse_expr(struct calc_parser* p, bool* ok) {
-        double value = calc_parse_term(p, ok);
-
-        while(*ok) {
-                calc_skip_spaces(p);
-
-                if(*p->s == '+') {
-                        ++p->s;
-                        value += calc_parse_term(p, ok);
-                } else if(*p->s == '-') {
-                        ++p->s;
-                        value -= calc_parse_term(p, ok);
-                } else {
-                        break;
-                }
-        }
-
-        return value;
-}
-
-static bool calc_eval_expression(const char* text, double* out) {
-        if(text == NULL || out == NULL) {
-            return false;
-        }
-
-        struct calc_parser p = { .s = text };
-        bool ok = true;
-
-        double value = calc_parse_expr(&p, &ok);
-        calc_skip_spaces(&p);
-
-        if(!ok || *p.s != '\0') {
-                return false;
-        }
-
-        *out = value;
-        return true;
-}
-
-
-
 static GtkWidget* create_calc_row(void) {
         GtkWidget* box = wofi_property_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
@@ -825,32 +703,6 @@ static void update_calc_row(const char* input) {
 
         gtk_widget_show(calc_child);
 }
-static bool calc_input_is_expression(const char* text) {
-        if(text == NULL || *text == '\0') {
-                return false;
-        }
-
-        bool has_digit = false;
-
-        for(const char* p = text; *p; ++p) {
-                char c = *p;
-
-                if(c >= '0' && c <= '9') {
-                        has_digit = true;
-                        continue;
-                }
-
-                if(c == ' ' || c == '.' || c == '+' || c == '-' ||
-                   c == '*' || c == '/' || c == '(' || c == ')') {
-                        continue;
-                }
-
-                return false;
-        }
-
-        return has_digit;
-}
-
 static bool is_calc_box(GtkWidget* widget) {
         if(widget == NULL || !WOFI_IS_PROPERTY_BOX(widget)) {
                 return false;
@@ -940,7 +792,6 @@ static void activate_item(GtkFlowBox* flow_box, GtkFlowBoxChild* row, gpointer d
                 wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action")
         );
 }
-
 //
 static void expand(GtkExpander* expander, gpointer data) {
 	(void) data;
