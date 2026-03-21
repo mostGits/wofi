@@ -43,6 +43,8 @@
 
 #include <pango/pango.h>
 #include <gdk/gdkwayland.h>
+//Most
+#include <math.h>
 
 #define PROTO_VERSION(v1, v2) (v1 < v2 ? v1 : v2)
 #define _UNUSED(x) (void)(x)
@@ -119,6 +121,10 @@ static bool hide_search = false;
 static GdkModifierType shift_mask = GDK_SHIFT_MASK;
 static GdkModifierType ctrl_mask = GDK_CONTROL_MASK;
 static GdkModifierType alt_mask = GDK_MOD1_MASK;
+//Most
+static GtkWidget* calc_child = NULL;
+static GtkWidget* calc_box = NULL;
+static GtkWidget* calc_label = NULL;
 
 static struct map* keys;
 static struct map* mods;
@@ -128,7 +134,17 @@ static struct wl_surface* wl_surface;
 static struct wl_list outputs;
 static struct zxdg_output_manager_v1* output_manager;
 static struct zwlr_layer_surface_v1* wlr_surface;
+//Most
+static void widget_allocate(GtkWidget* widget, GdkRectangle* allocation, gpointer data);
+static void update_calc_row(const char* input);
+static bool calc_input_is_expression(const char* text);
+static bool is_calc_box(GtkWidget* widget);
+static void copy_text_to_clipboard(const gchar* text);
 
+static bool calc_input_is_expression(const char* text);
+static bool calc_eval_expression(const char* text, double* out);
+static void update_calc_row(const char* input);
+//
 struct output_node {
 	char* name;
 	struct wl_output* output;
@@ -223,7 +239,9 @@ static gboolean do_search(gpointer data) {
 		if(filter != NULL) {
 			free(filter);
 		}
+		//Most
 		filter = strdup(new_filter);
+		update_calc_row(new_filter);
 		gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(inner_box));
 		gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(inner_box));
 		GtkFlowBoxChild* child = gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(inner_box), 0);
@@ -605,6 +623,249 @@ static GtkWidget* create_label(char* mode, char* text, char* search_text, char* 
 	}
 	return box;
 }
+//Most
+struct calc_parser {
+        const char* s;
+};
+
+static void calc_skip_spaces(struct calc_parser* p) {
+        while(*p->s == ' ' || *p->s == '\t' || *p->s == '\n') {
+                ++p->s;
+        }
+}
+
+static double calc_parse_expr(struct calc_parser* p, bool* ok);
+
+static double calc_parse_number(struct calc_parser* p, bool* ok) {
+        calc_skip_spaces(p);
+
+        char* end = NULL;
+        double value = strtod(p->s, &end);
+
+        if(end == p->s) {
+                *ok = false;
+                return 0.0;
+        }
+
+        p->s = end;
+        return value;
+}
+
+static double calc_parse_factor(struct calc_parser* p, bool* ok) {
+        calc_skip_spaces(p);
+
+        if(*p->s == '(') {
+                ++p->s;
+                double value = calc_parse_expr(p, ok);
+                calc_skip_spaces(p);
+
+                if(*p->s != ')') {
+                        *ok = false;
+                        return 0.0;
+                }
+
+                ++p->s;
+                return value;
+        }
+
+        if(*p->s == '-') {
+                ++p->s;
+                return -calc_parse_factor(p, ok);
+        }
+
+        return calc_parse_number(p, ok);
+}
+
+static double calc_parse_term(struct calc_parser* p, bool* ok) {
+        double value = calc_parse_factor(p, ok);
+
+        while(*ok) {
+                calc_skip_spaces(p);
+
+                if(*p->s == '*') {
+                        ++p->s;
+                        value *= calc_parse_factor(p, ok);
+                } else if(*p->s == '/') {
+                        ++p->s;
+                        double rhs = calc_parse_factor(p, ok);
+                        if(!*ok) {
+                                return 0.0;
+                        }
+                        if(rhs == 0.0) {
+                                *ok = false;
+                                return 0.0;
+                        }
+                        value /= rhs;
+                } else {
+                        break;
+                }
+        }
+
+        return value;
+}
+
+static double calc_parse_expr(struct calc_parser* p, bool* ok) {
+        double value = calc_parse_term(p, ok);
+
+        while(*ok) {
+                calc_skip_spaces(p);
+
+                if(*p->s == '+') {
+                        ++p->s;
+                        value += calc_parse_term(p, ok);
+                } else if(*p->s == '-') {
+                        ++p->s;
+                        value -= calc_parse_term(p, ok);
+                } else {
+                        break;
+                }
+        }
+
+        return value;
+}
+
+static bool calc_eval_expression(const char* text, double* out) {
+        if(text == NULL || out == NULL) {
+            return false;
+        }
+
+        struct calc_parser p = { .s = text };
+        bool ok = true;
+
+        double value = calc_parse_expr(&p, &ok);
+        calc_skip_spaces(&p);
+
+        if(!ok || *p.s != '\0') {
+                return false;
+        }
+
+        *out = value;
+        return true;
+}
+
+
+
+static GtkWidget* create_calc_row(void) {
+        GtkWidget* box = wofi_property_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+
+        setup_label("drun", WOFI_PROPERTY_BOX(box));
+
+        wofi_property_box_add_property(WOFI_PROPERTY_BOX(box), "action", "test");
+        wofi_property_box_add_property(WOFI_PROPERTY_BOX(box), "filter", "test");
+
+        GtkWidget* label = gtk_label_new("= test");
+        gtk_widget_set_name(label, "text");
+        gtk_label_set_xalign(GTK_LABEL(label), 0);
+        gtk_container_add(GTK_CONTAINER(box), label);
+
+        calc_box = box;
+        calc_label = label;
+
+        GtkWidget* child = gtk_flow_box_child_new();
+        gtk_widget_set_name(child, "entry");
+        g_signal_connect(child, "size-allocate", G_CALLBACK(widget_allocate), NULL);
+        gtk_container_add(GTK_CONTAINER(child), box);
+
+        calc_child = child;
+        return child;
+}
+static void update_calc_row(const char* input) {
+        if(calc_child == NULL || calc_box == NULL || calc_label == NULL) {
+                return;
+        }
+
+        if(!calc_input_is_expression(input)) {
+                gtk_widget_hide(calc_child);
+                return;
+        }
+
+        double result;
+        if(!calc_eval_expression(input, &result)) {
+                gtk_widget_hide(calc_child);
+                return;
+        }
+
+        char result_text[128];
+        if(fabs(result - round(result)) < 1e-9) {
+                snprintf(result_text, sizeof(result_text), "%.0f", result);
+        } else {
+                snprintf(result_text, sizeof(result_text), "%.10g", result);
+        }
+
+        char label_text[160];
+        snprintf(label_text, sizeof(label_text), "= %s", result_text);
+
+        gtk_label_set_text(GTK_LABEL(calc_label), label_text);
+
+        wofi_property_box_add_property(WOFI_PROPERTY_BOX(calc_box), "action", strdup(result_text));
+        wofi_property_box_add_property(WOFI_PROPERTY_BOX(calc_box), "filter", strdup(input));
+
+        gtk_widget_show_all(calc_child);
+}
+static bool calc_input_is_expression(const char* text) {
+        if(text == NULL || *text == '\0') {
+                return false;
+        }
+
+        bool has_digit = false;
+
+        for(const char* p = text; *p; ++p) {
+                char c = *p;
+
+                if(c >= '0' && c <= '9') {
+                        has_digit = true;
+                        continue;
+                }
+
+                if(c == ' ' || c == '.' || c == '+' || c == '-' ||
+                   c == '*' || c == '/' || c == '(' || c == ')') {
+                        continue;
+                }
+
+                return false;
+        }
+
+        return has_digit;
+}
+
+static bool is_calc_box(GtkWidget* widget) {
+        if(widget == NULL || !WOFI_IS_PROPERTY_BOX(widget)) {
+                return false;
+        }
+
+        const gchar* action = wofi_property_box_get_property(WOFI_PROPERTY_BOX(widget), "action");
+        return widget == calc_box && action != NULL;
+}
+
+static void copy_text_to_clipboard(const gchar* text) {
+        if(text == NULL || *text == '\0') {
+                return;
+        }
+
+        int fds[2];
+        if(pipe(fds) == -1) {
+                perror("pipe broken");
+                wofi_exit(EXIT_FAILURE);
+        }
+
+        if(fork() == 0) {
+                close(fds[1]);
+                dup2(fds[0], STDIN_FILENO);
+                execlp(copy_exec, copy_exec, NULL);
+                fprintf(stderr, "%s could not be executed: %s\n", copy_exec, strerror(errno));
+                exit(errno);
+        }
+
+        close(fds[0]);
+
+        if(write(fds[1], text, strlen(text)) <= 0) {
+                fprintf(stderr, "fd pipe failed to write\n");
+        }
+
+        close(fds[1]);
+        while(waitpid(-1, NULL, WNOHANG) > 0);
+}
+//
 
 static char* get_cache_path(const gchar* mode) {
 	if (cache_file != NULL)
@@ -623,18 +884,41 @@ static void execute_action(const gchar* mode, const gchar* cmd) {
 	struct mode* mode_ptr = map_get(modes, mode);
 	mode_ptr->mode_exec(cmd);
 }
-
+//Most Replaced this  this 
+// static void activate_item(GtkFlowBox* flow_box, GtkFlowBoxChild* row, gpointer data) {
+// 	(void) flow_box;
+// 	(void) data;
+// 	GtkWidget* box = gtk_bin_get_child(GTK_BIN(row));
+// 	bool primary_action = GTK_IS_EXPANDER(box);
+// 	if(primary_action) {
+// 		box = gtk_expander_get_label_widget(GTK_EXPANDER(box));
+// 	}
+// 	execute_action(wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "mode"), wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action"));
+// }
+//with this 
 static void activate_item(GtkFlowBox* flow_box, GtkFlowBoxChild* row, gpointer data) {
-	(void) flow_box;
-	(void) data;
-	GtkWidget* box = gtk_bin_get_child(GTK_BIN(row));
-	bool primary_action = GTK_IS_EXPANDER(box);
-	if(primary_action) {
-		box = gtk_expander_get_label_widget(GTK_EXPANDER(box));
-	}
-	execute_action(wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "mode"), wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action"));
+        (void) flow_box;
+        (void) data;
+
+        GtkWidget* box = gtk_bin_get_child(GTK_BIN(row));
+        bool primary_action = GTK_IS_EXPANDER(box);
+        if(primary_action) {
+                box = gtk_expander_get_label_widget(GTK_EXPANDER(box));
+        }
+
+        if(is_calc_box(box)) {
+                const gchar* action = wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action");
+                copy_text_to_clipboard(action);
+                return;
+        }
+
+        execute_action(
+                wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "mode"),
+                wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action")
+        );
 }
 
+//
 static void expand(GtkExpander* expander, gpointer data) {
 	(void) data;
 	GtkWidget* box = gtk_bin_get_child(GTK_BIN(expander));
@@ -2178,6 +2462,11 @@ void wofi_init(struct map* _config) {
 
 	gtk_flow_box_set_filter_func(GTK_FLOW_BOX(inner_box), do_filter, NULL, NULL);
 	gtk_flow_box_set_sort_func(GTK_FLOW_BOX(inner_box), do_sort, NULL, NULL);
+	//Most
+	GtkWidget* calc = create_calc_row();
+	gtk_container_add(GTK_CONTAINER(inner_box), calc);
+	gtk_widget_hide(calc);
+
 
 	g_signal_connect(inner_box, "child-activated", G_CALLBACK(activate_item), NULL);
 	g_signal_connect(inner_box, "selected-children-changed", G_CALLBACK(select_item), NULL);
