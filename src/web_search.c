@@ -31,7 +31,7 @@ void web_search_configure(const char* tmpl, const char* browsers_csv) {
 		engine_template = strdup(tmpl);
 	} else {
 		/* ia=web: prefer web tab over news/maps where applicable */
-		engine_template = strdup("https://duckduckgo.com/?q=%s&ia=web");
+		engine_template = strdup("https://google.com/?q=%s&ia=web");
 	}
 
 	if(browsers_csv == NULL || *browsers_csv == '\0') {
