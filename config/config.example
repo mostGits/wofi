@@ -1,0 +1,57 @@
+# Wofi configuration example
+#
+# Install: copy this file to:
+#   ~/.config/wofi/config
+# Or run once with: wofi --conf /path/to/config.example …
+#
+# Same directory can hold style.css (see "style" below) and optional color files.
+# Syntax: key=value   (use \# in a value if you need a literal #)
+
+# --- Mode (override with wofi --show … if you prefer) ---
+mode=drun
+
+# --- Window ---
+width=50%
+height=40%
+location=center
+layer=top
+normal_window=false
+prompt=
+
+# --- Search / filtering (main list) ---
+filter_rate=100
+matching=contains
+insensitive=true
+parse_search=false
+exec_search=false
+hide_search=false
+dynamic_lines=false
+
+# --- Search features: ~ home file search, ? web search, calculator ---
+# Tilde file search: max rows, debounce (ms, 0 = every keystroke), extra roots (CSV, optional)
+files_search_max_matches=200
+files_search_debounce_ms=120
+files_search_extra_dirs=
+
+# Web search (?query): URL template (%s = encoded query), browsers for extra rows
+web_search_engine=https://duckduckgo.com/?q=%s&ia=web
+web_browsers=firefox,chromium
+
+# --- Appearance ---
+# stylesheet path: absolute, or relative to ~/.config/wofi/
+# style=style.css
+# gtk_dark=false
+
+# --- Input / UX ---
+sort_order=default
+columns=1
+lines=0
+single_click=false
+no_actions=false
+copy_exec=wl-copy
+
+# --- Misc ---
+allow_images=false
+allow_markup=false
+image_size=32
+hide_scroll=false

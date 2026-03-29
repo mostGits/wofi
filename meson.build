@@ -30,6 +30,9 @@ sources = ['src/config.c',
 			'src/widget_builder.c',
 			'src/wofi.c',
 			'src/calc.c',
+			'modes/files.c',
+			'src/files_search.c',
+			'src/web_search.c',
 			'proto/wlr-layer-shell-unstable-v1-protocol.c',
 			'proto/xdg-output-unstable-v1-protocol.c',
 			'proto/xdg-shell-protocol.c']
@@ -48,6 +51,10 @@ endif
 if get_option('enable_dmenu')
 	sources += 'modes/dmenu.c'
 endif
+
+install_data('config/config.example',
+  install_dir: join_paths(get_option('datadir'), 'doc', meson.project_name()),
+  rename: 'config.example')
 
 install_man('man/wofi.1',
 			'man/wofi.3',

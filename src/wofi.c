@@ -47,6 +47,8 @@
 #include <gdk/gdkwayland.h>
 //Most
 #include <math.h>
+#include <files_search.h>
+#include <web_search.h>
 
 #define PROTO_VERSION(v1, v2) (v1 < v2 ? v1 : v2)
 #define _UNUSED(x) (void)(x)
@@ -78,6 +80,9 @@ static uint64_t width, height;
 static char* x, *y;
 static struct zwlr_layer_shell_v1* shell = NULL;
 static GtkWidget* window, *outer_box, *scroll, *entry, *inner_box, *previous_selection = NULL;
+static GtkWidget* file_search_bar = NULL;
+static GtkWidget* file_search_type_combo = NULL;
+static GtkWidget* file_search_ext_entry = NULL;
 static gchar* filter = NULL;
 static char* mode = NULL;
 static bool allow_images, allow_markup;
@@ -129,7 +134,11 @@ static GtkWidget* calc_box = NULL;
 static GtkWidget* calc_label = NULL;
 static char* calc_action_str = NULL;
 static char* calc_filter_str = NULL;
-
+static GList* saved_inner_children = NULL;
+static bool mode_widgets_inserted = false;
+static guint file_search_debounce_id = 0;
+static uint64_t file_search_debounce_ms = 120;
+static size_t file_search_last_len = 0;
 
 static struct map* keys;
 static struct map* mods;
@@ -139,12 +148,26 @@ static struct wl_surface* wl_surface;
 static struct wl_list outputs;
 static struct zxdg_output_manager_v1* output_manager;
 static struct zwlr_layer_surface_v1* wlr_surface;
-//Most
+//Most Prototypes
+static gboolean _insert_widget(gpointer data);
 static void widget_allocate(GtkWidget* widget, GdkRectangle* allocation, gpointer data);
 static void update_calc_row(const char* input);
 static bool is_calc_box(GtkWidget* widget);
 static void copy_text_to_clipboard(const gchar* text);
-
+static void ensure_mode_widgets_inserted(void);
+static void save_inner_box_state(void);
+static void restore_inner_box_state(void);
+static void update_file_search_ui(const char* filter_text);
+static void on_files_index_ready(void* user_data);
+static void update_web_search_ui(const char* filter_text);
+static void hide_calc_row(void);
+static void cancel_file_search_debounce(void);
+static void schedule_file_search_debounce(void);
+static void file_search_bar_set_visible(gboolean visible);
+static void apply_file_search_options(void);
+static void on_file_search_options_changed(GtkWidget* w, gpointer d);
+static gboolean close_after_copy(gpointer data);
+static void do_copy(void);
 //
 struct output_node {
 	char* name;
@@ -236,20 +259,68 @@ static void setup_surface(struct zwlr_layer_surface_v1* surface) {
 static gboolean do_search(gpointer data) {
 	(void) data;
 	const gchar* new_filter = gtk_entry_get_text(GTK_ENTRY(entry));
+
 	if(filter == NULL || strcmp(new_filter, filter) != 0) {
 		if(filter != NULL) {
 			free(filter);
 		}
-		//Most
+
 		filter = strdup(new_filter);
+
+		if(new_filter[0] != '~') {
+			cancel_file_search_debounce();
+			file_search_last_len = 0;
+			file_search_bar_set_visible(FALSE);
+		}
+
+		if(new_filter[0] == '~') {
+			file_search_bar_set_visible(TRUE);
+			ensure_mode_widgets_inserted();
+			if(saved_inner_children == NULL) {
+				save_inner_box_state();
+			}
+			hide_calc_row();
+			size_t len = strlen(new_filter);
+			bool shrinking = file_search_last_len > 0 && len < file_search_last_len;
+			bool lone_tilde = len == 1;
+			file_search_last_len = len;
+
+			if(file_search_debounce_ms == 0) {
+				update_file_search_ui(new_filter);
+			} else if(shrinking || lone_tilde) {
+				cancel_file_search_debounce();
+				update_file_search_ui(new_filter);
+			} else {
+				schedule_file_search_debounce();
+			}
+			return G_SOURCE_CONTINUE;
+		}
+
+		if(new_filter[0] == '?') {
+			ensure_mode_widgets_inserted();
+			if(saved_inner_children == NULL) {
+				save_inner_box_state();
+			}
+			hide_calc_row();
+			update_web_search_ui(new_filter);
+			return G_SOURCE_CONTINUE;
+		}
+
+		if(saved_inner_children != NULL) {
+			restore_inner_box_state();
+		}
+
 		update_calc_row(new_filter);
+
 		gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(inner_box));
 		gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(inner_box));
+
 		GtkFlowBoxChild* child = gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(inner_box), 0);
 		if(child != NULL) {
 			gtk_flow_box_select_child(GTK_FLOW_BOX(inner_box), child);
 		}
 	}
+
 	return G_SOURCE_CONTINUE;
 }
 
@@ -624,7 +695,7 @@ static GtkWidget* create_label(char* mode, char* text, char* search_text, char* 
 	}
 	return box;
 }
-//Most
+//Most helpers
 static GtkWidget* create_calc_row(void) {
         GtkWidget* box = wofi_property_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
@@ -656,10 +727,218 @@ static GtkWidget* create_calc_row(void) {
         calc_child = child;
         return child;
 }
+static void destroy_child_widget(GtkWidget* widget, gpointer data) {
+	(void) data;
+	gtk_widget_destroy(widget);
+}
+
+static void ensure_mode_widgets_inserted(void) {
+	if(mode_widgets_inserted) {
+		return;
+	}
+	if(!has_joined_mode) {
+		pthread_join(mode_thread, NULL);
+		has_joined_mode = true;
+	}
+	struct wl_list* modes = &mode_list;
+	while(modes->prev != modes) {
+		struct mode* mode = wl_container_of(modes->prev, mode, link);
+		if(!_insert_widget(mode)) {
+			wl_list_remove(&mode->link);
+		}
+	}
+	mode_widgets_inserted = true;
+}
+
+static void save_inner_box_state(void) {
+	if(saved_inner_children != NULL) {
+		return;
+	}
+	GList* children = gtk_container_get_children(GTK_CONTAINER(inner_box));
+	for(GList* l = children; l != NULL; l = l->next) {
+		GtkWidget* w = GTK_WIDGET(l->data);
+		g_object_ref(w);
+		gtk_container_remove(GTK_CONTAINER(inner_box), w);
+		saved_inner_children = g_list_append(saved_inner_children, w);
+	}
+	g_list_free(children);
+}
+
+static void restore_inner_box_state(void) {
+	if(saved_inner_children == NULL) {
+		return;
+	}
+	previous_selection = NULL;
+	gtk_container_foreach(GTK_CONTAINER(inner_box), destroy_child_widget, NULL);
+	for(GList* l = saved_inner_children; l != NULL; l = l->next) {
+		gtk_container_add(GTK_CONTAINER(inner_box), GTK_WIDGET(l->data));
+		g_object_unref(l->data);
+	}
+	g_list_free(saved_inner_children);
+	saved_inner_children = NULL;
+	gtk_widget_show_all(inner_box);
+	gtk_flow_box_invalidate_filter(GTK_FLOW_BOX(inner_box));
+	gtk_flow_box_invalidate_sort(GTK_FLOW_BOX(inner_box));
+	GList* ch = gtk_container_get_children(GTK_CONTAINER(inner_box));
+	line_count = (uint32_t) g_list_length(ch);
+	g_list_free(ch);
+	GtkFlowBoxChild* child = gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(inner_box), 0);
+	if(child != NULL) {
+		gtk_flow_box_select_child(GTK_FLOW_BOX(inner_box), child);
+	}
+}
+
+static void hide_calc_row(void) {
+	if(calc_child != NULL) {
+		gtk_widget_hide(calc_child);
+	}
+}
+
+static void file_search_bar_set_visible(gboolean visible) {
+	if(file_search_bar != NULL) {
+		gtk_widget_set_visible(file_search_bar, visible);
+	}
+}
+
+static void apply_file_search_options(void) {
+	if(file_search_type_combo == NULL || file_search_ext_entry == NULL) {
+		return;
+	}
+	int act = gtk_combo_box_get_active(GTK_COMBO_BOX(file_search_type_combo));
+	if(act < 0 || act > 2) {
+		act = 0;
+	}
+	const char* ext = gtk_entry_get_text(GTK_ENTRY(file_search_ext_entry));
+	files_search_set_options((FilesSearchListing) act, ext);
+	gtk_widget_set_sensitive(file_search_ext_entry, act != FILES_SEARCH_FOLDERS_ONLY);
+}
+
+static void on_file_search_options_changed(GtkWidget* w, gpointer d) {
+	(void) w;
+	(void) d;
+	const gchar* t = gtk_entry_get_text(GTK_ENTRY(entry));
+	if(t != NULL && t[0] == '~') {
+		update_file_search_ui(t);
+	}
+}
+
+static void on_files_index_ready(void* user_data) {
+	(void) user_data;
+	const gchar* t = gtk_entry_get_text(GTK_ENTRY(entry));
+	if(t != NULL && t[0] == '~') {
+		update_file_search_ui(t);
+	}
+}
+
+static void update_file_search_ui(const char* filter_text) {
+	previous_selection = NULL;
+	apply_file_search_options();
+	gtk_container_foreach(GTK_CONTAINER(inner_box), destroy_child_widget, NULL);
+
+	char* base_dir = NULL;
+	char* query = NULL;
+	if(!files_search_parse(filter_text, &base_dir, &query)) {
+		return;
+	}
+
+	files_search_fill_matches(base_dir, query);
+	free(base_dir);
+	free(query);
+
+	for(size_t i = 0; i < files_search_get_match_count(); ++i) {
+		const char* display = files_search_get_display(i);
+		const char* full_path = files_search_get_path(i);
+		if(display == NULL || full_path == NULL) {
+			continue;
+		}
+		GtkWidget* box = create_label("file_search", (char*) display, (char*) filter_text, (char*) full_path);
+		wofi_property_box_add_property(WOFI_PROPERTY_BOX(box), "kind", "file_search");
+		GtkWidget* child = gtk_flow_box_child_new();
+		gtk_widget_set_name(child, "entry");
+		g_signal_connect(child, "size-allocate", G_CALLBACK(widget_allocate), NULL);
+		gtk_container_add(GTK_CONTAINER(child), box);
+		gtk_widget_show_all(child);
+		gtk_container_add(GTK_CONTAINER(inner_box), child);
+	}
+	GList* ch = gtk_container_get_children(GTK_CONTAINER(inner_box));
+	line_count = (uint32_t) g_list_length(ch);
+	g_list_free(ch);
+	GtkFlowBoxChild* first = gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(inner_box), 0);
+	if(first != NULL) {
+		gtk_flow_box_select_child(GTK_FLOW_BOX(inner_box), first);
+	}
+}
+
+static void cancel_file_search_debounce(void) {
+	if(file_search_debounce_id != 0) {
+		g_source_remove(file_search_debounce_id);
+		file_search_debounce_id = 0;
+	}
+}
+
+static gboolean file_search_debounce_cb(gpointer data) {
+	(void) data;
+	file_search_debounce_id = 0;
+	const gchar* t = gtk_entry_get_text(GTK_ENTRY(entry));
+	if(t != NULL && t[0] == '~') {
+		update_file_search_ui(t);
+	}
+	return G_SOURCE_REMOVE;
+}
+
+static void schedule_file_search_debounce(void) {
+	cancel_file_search_debounce();
+	file_search_debounce_id = g_timeout_add((guint) file_search_debounce_ms, file_search_debounce_cb, NULL);
+}
+
+static void update_web_search_ui(const char* filter_text) {
+	previous_selection = NULL;
+	gtk_container_foreach(GTK_CONTAINER(inner_box), destroy_child_widget, NULL);
+
+	for(size_t i = 0; i < web_search_row_count(filter_text); ++i) {
+		char* label = NULL;
+		char* action = NULL;
+		if(!web_search_get_row(i, filter_text, &label, &action)) {
+			continue;
+		}
+		GtkWidget* box = create_label("web_search", label, (char*) filter_text, action);
+		g_free(label);
+		wofi_property_box_add_property(WOFI_PROPERTY_BOX(box), "kind", "web_search");
+		GtkWidget* child = gtk_flow_box_child_new();
+		gtk_widget_set_name(child, "entry");
+		g_signal_connect(child, "size-allocate", G_CALLBACK(widget_allocate), NULL);
+		gtk_container_add(GTK_CONTAINER(child), box);
+		gtk_widget_show_all(child);
+		gtk_container_add(GTK_CONTAINER(inner_box), child);
+	}
+	GList* ch = gtk_container_get_children(GTK_CONTAINER(inner_box));
+	line_count = (uint32_t) g_list_length(ch);
+	g_list_free(ch);
+	GtkFlowBoxChild* first = gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(inner_box), 0);
+	if(first != NULL) {
+		gtk_flow_box_select_child(GTK_FLOW_BOX(inner_box), first);
+	}
+}
 static void update_calc_row(const char* input) {
         if(calc_child == NULL || calc_box == NULL || calc_label == NULL) {
                 return;
         }
+
+        if(calc_action_str != NULL) {
+                free(calc_action_str);
+                calc_action_str = NULL;
+        }
+
+        if(calc_filter_str != NULL) {
+                free(calc_filter_str);
+                calc_filter_str = NULL;
+        }
+
+        calc_action_str = strdup("");
+        calc_filter_str = strdup("");
+
+        wofi_property_box_add_property(WOFI_PROPERTY_BOX(calc_box), "action", calc_action_str);
+        wofi_property_box_add_property(WOFI_PROPERTY_BOX(calc_box), "filter", calc_filter_str);
 
         if(!calc_input_is_expression(input)) {
                 gtk_label_set_text(GTK_LABEL(calc_label), "");
@@ -675,25 +954,14 @@ static void update_calc_row(const char* input) {
         }
 
         char result_text[128];
-        if(fabs(result - round(result)) < 1e-9) {
-                snprintf(result_text, sizeof(result_text), "%.0f", result);
-        } else {
-                snprintf(result_text, sizeof(result_text), "%.10g", result);
-        }
+		snprintf(result_text, sizeof(result_text), "%.10g", result);
 
-        char label_text[160];
-        snprintf(label_text, sizeof(label_text), "= %s", result_text);
+        char label_text[200];
+        snprintf(label_text, sizeof(label_text), "= %s    click to copy", result_text);
         gtk_label_set_text(GTK_LABEL(calc_label), label_text);
 
-        if(calc_action_str != NULL) {
-                free(calc_action_str);
-                calc_action_str = NULL;
-        }
-
-        if(calc_filter_str != NULL) {
-                free(calc_filter_str);
-                calc_filter_str = NULL;
-        }
+        free(calc_action_str);
+        free(calc_filter_str);
 
         calc_action_str = strdup(result_text);
         calc_filter_str = strdup(input);
@@ -711,7 +979,11 @@ static bool is_calc_box(GtkWidget* widget) {
         const gchar* kind = wofi_property_box_get_property(WOFI_PROPERTY_BOX(widget), "kind");
         return kind != NULL && strcmp(kind, "calc") == 0;
 }
-
+static gboolean close_after_copy(gpointer data) {
+        (void) data;
+        gtk_widget_destroy(window);
+        return G_SOURCE_REMOVE;
+}
 static void copy_text_to_clipboard(const gchar* text) {
         if(text == NULL || *text == '\0') {
                 return;
@@ -723,21 +995,41 @@ static void copy_text_to_clipboard(const gchar* text) {
                 wofi_exit(EXIT_FAILURE);
         }
 
-        if(fork() == 0) {
+        pid_t pid = fork();
+        if(pid == -1) {
+                perror("fork failed");
+                close(fds[0]);
                 close(fds[1]);
-                dup2(fds[0], STDIN_FILENO);
+                wofi_exit(EXIT_FAILURE);
+        }
+
+        if(pid == 0) {
+                close(fds[1]);
+
+                if(dup2(fds[0], STDIN_FILENO) == -1) {
+                        perror("dup2 failed");
+                        close(fds[0]);
+                        exit(EXIT_FAILURE);
+                }
+
+                close(fds[0]);
+
                 execlp(copy_exec, copy_exec, NULL);
                 fprintf(stderr, "%s could not be executed: %s\n", copy_exec, strerror(errno));
-                exit(errno);
+                exit(EXIT_FAILURE);
         }
 
         close(fds[0]);
 
-        if(write(fds[1], text, strlen(text)) <= 0) {
-                fprintf(stderr, "fd pipe failed to write\n");
+        ssize_t len = (ssize_t) strlen(text);
+        ssize_t written = write(fds[1], text, len);
+		write(fds[1], "\n", 1);
+        if(written != len) {
+                fprintf(stderr, "failed to write full clipboard content\n");
         }
 
         close(fds[1]);
+
         while(waitpid(-1, NULL, WNOHANG) > 0);
 }
 //
@@ -756,6 +1048,21 @@ static char* get_cache_path(const gchar* mode) {
 }
 
 static void execute_action(const gchar* mode, const gchar* cmd) {
+	if(mode != NULL && strcmp(mode, "file_search") == 0) {
+		if(cmd != NULL && fork() == 0) {
+			execlp("xdg-open", "xdg-open", cmd, NULL);
+			_exit(EXIT_FAILURE);
+		}
+		while(waitpid(-1, NULL, WNOHANG) > 0) {
+		}
+		wofi_exit(0);
+		return;
+	}
+	if(mode != NULL && strcmp(mode, "web_search") == 0) {
+		web_search_execute(cmd);
+		wofi_exit(0);
+		return;
+	}
 	struct mode* mode_ptr = map_get(modes, mode);
 	mode_ptr->mode_exec(cmd);
 }
@@ -781,11 +1088,8 @@ static void activate_item(GtkFlowBox* flow_box, GtkFlowBoxChild* row, gpointer d
                 box = gtk_expander_get_label_widget(GTK_EXPANDER(box));
         }
 
-        if(is_calc_box(box)) {
-                const gchar* action = wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action");
-                copy_text_to_clipboard(action);
-                return;
-        }
+
+		
 
         execute_action(
                 wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "mode"),
@@ -952,12 +1256,16 @@ static gboolean _insert_widget(gpointer data) {
 }
 
 static gboolean insert_all_widgets(gpointer data) {
+	if(mode_widgets_inserted) {
+		return FALSE;
+	}
 	if(!has_joined_mode) {
 		pthread_join(mode_thread, NULL);
 		has_joined_mode = true;
 	}
 	struct wl_list* modes = data;
 	if(modes->prev == modes) {
+		mode_widgets_inserted = true;
 		return FALSE;
 	} else {
 		struct mode* mode = wl_container_of(modes->prev, mode, link);
@@ -1252,6 +1560,10 @@ static void select_item(GtkFlowBox* flow_box, gpointer data) {
 		flag_box(GTK_BOX(previous_selection), GTK_STATE_FLAG_NORMAL);
 	}
 	GList* selected_children = gtk_flow_box_get_selected_children(flow_box);
+	if(selected_children == NULL || selected_children->data == NULL) {
+		g_list_free(selected_children);
+		return;
+	}
 	GtkWidget* box = gtk_bin_get_child(GTK_BIN(selected_children->data));
 	g_list_free(selected_children);
 	if(GTK_IS_EXPANDER(box)) {
@@ -1275,11 +1587,12 @@ static void activate_search(GtkEntry* entry, gpointer data) {
                         box = gtk_expander_get_label_widget(GTK_EXPANDER(box));
                 }
 
-                if(is_calc_box(box)) {
-                        const gchar* action = wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action");
-                        copy_text_to_clipboard(action);
-                        return;
-                }
+			if(is_calc_box(box)) {
+					const gchar* action = wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action");
+					copy_text_to_clipboard(action);
+					g_timeout_add(500, close_after_copy, NULL);
+					return;
+			}
         }
 
         if(mode != NULL && (exec_search || child == NULL || !is_visible)) {
@@ -1297,15 +1610,32 @@ static void activate_search(GtkEntry* entry, gpointer data) {
                 );
         }
 }
-
+//Most modify
 static gboolean filter_proxy(GtkFlowBoxChild* row) {
-	GtkWidget* box = gtk_bin_get_child(GTK_BIN(row));
-	if(GTK_IS_EXPANDER(box)) {
-		box = gtk_expander_get_label_widget(GTK_EXPANDER(box));
-	}
-	const gchar* text =
-			wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "filter");
-	return match_for_matching_mode(filter, text, matching, insensitive);
+        GtkWidget* box = gtk_bin_get_child(GTK_BIN(row));
+        if(GTK_IS_EXPANDER(box)) {
+                box = gtk_expander_get_label_widget(GTK_EXPANDER(box));
+        }
+
+        if(is_calc_box(box)) {
+                if(calc_child == NULL || !gtk_widget_get_visible(calc_child)) {
+                        return FALSE;
+                }
+
+                const gchar* action = wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "action");
+                return action != NULL && *action != '\0';
+        }
+
+        const gchar* kind = wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "kind");
+        if(kind != NULL && strcmp(kind, "file_search") == 0) {
+                return TRUE;
+        }
+        if(kind != NULL && strcmp(kind, "web_search") == 0) {
+                return TRUE;
+        }
+
+        const gchar* text = wofi_property_box_get_property(WOFI_PROPERTY_BOX(box), "filter");
+        return match_for_matching_mode(filter, text, matching, insensitive);
 }
 
 static void do_resize_surface_after_filter(GtkFlowBoxChild *row, gboolean filter_return) {
@@ -1383,8 +1713,15 @@ static gint do_sort(GtkFlowBoxChild* child1, GtkFlowBoxChild* child2, gpointer d
 
 static void select_idx(gint idx) {
 	GtkFlowBoxChild* child = gtk_flow_box_get_child_at_index(GTK_FLOW_BOX(inner_box), idx);
-	gtk_widget_grab_focus(GTK_WIDGET(child));
-	gtk_flow_box_select_child(GTK_FLOW_BOX(inner_box), GTK_FLOW_BOX_CHILD(child));
+	if(child == NULL) {
+		return;
+	}
+	GtkWidget* w = GTK_WIDGET(child);
+	if(!gtk_widget_get_realized(w)) {
+		gtk_widget_realize(w);
+	}
+	gtk_widget_grab_focus(w);
+	gtk_flow_box_select_child(GTK_FLOW_BOX(inner_box), child);
 }
 
 static GdkModifierType get_mask_from_keystate(guint state) {
@@ -1435,7 +1772,7 @@ static void move_down(void) {
 	user_moved = true;
 	if(outer_orientation == GTK_ORIENTATION_VERTICAL) {
 		if(gtk_widget_has_focus(entry) || gtk_widget_has_focus(scroll)) {
-			select_idx(1);
+			select_idx(0);
 			return;
 		}
 	}
@@ -1451,7 +1788,7 @@ static void move_right(void) {
 	user_moved = true;
 	if(outer_orientation == GTK_ORIENTATION_HORIZONTAL) {
 		if(gtk_widget_has_focus(entry) || gtk_widget_has_focus(scroll)) {
-			select_idx(1);
+			select_idx(0);
 			return;
 		}
 	}
@@ -1461,7 +1798,7 @@ static void move_right(void) {
 static void move_forward(void) {
 	user_moved = true;
 	if(gtk_widget_has_focus(entry) || gtk_widget_has_focus(scroll)) {
-		select_idx(1);
+		select_idx(0);
 		return;
 	}
 
@@ -1501,7 +1838,7 @@ static void do_exit(void) {
 
 static void do_expand(void) {
 	GList* children = gtk_flow_box_get_selected_children(GTK_FLOW_BOX(inner_box));
-	if(children->data != NULL && gtk_widget_has_focus(children->data)) {
+	if(children != NULL && children->data != NULL && gtk_widget_has_focus(children->data)) {
 		GtkWidget* expander = gtk_bin_get_child(children->data);
 		if(GTK_IS_EXPANDER(expander)) {
 			g_signal_emit_by_name(expander, "activate");
@@ -1517,7 +1854,7 @@ static void do_hide_search(void) {
 //Most update
 static void do_copy(void) {
         GList* children = gtk_flow_box_get_selected_children(GTK_FLOW_BOX(inner_box));
-        if(children->data != NULL && gtk_widget_has_focus(children->data)) {
+        if(children != NULL && children->data != NULL && gtk_widget_has_focus(children->data)) {
                 GtkWidget* widget = gtk_bin_get_child(children->data);
                 if(GTK_IS_EXPANDER(widget)) {
                         GtkWidget* box = gtk_bin_get_child(GTK_BIN(widget));
@@ -1665,7 +2002,14 @@ static gboolean key_press(GtkWidget* widget, GdkEvent* event, gpointer data) {
 	if(gtk_widget_has_focus(entry) && printable) {
 		return FALSE;
 	}
-
+	if(gtk_widget_has_focus(entry)) {
+        if(event->key.keyval == GDK_KEY_Left ||
+           event->key.keyval == GDK_KEY_Right ||
+           event->key.keyval == GDK_KEY_Home ||
+           event->key.keyval == GDK_KEY_End) {
+                return FALSE;
+        }
+}
 	bool key_success = true;
 	struct key_entry* key_ent = NULL;
 	char* mod = NULL;
@@ -1702,8 +2046,8 @@ static gboolean key_press(GtkWidget* widget, GdkEvent* event, gpointer data) {
 		GList* children = gtk_flow_box_get_selected_children(GTK_FLOW_BOX(inner_box));
 		if(gtk_widget_has_focus(entry)) {
 			g_signal_emit_by_name(entry, "activate", entry, NULL);
-		} else if(gtk_widget_has_focus(inner_box) || children->data != NULL) {
-			gpointer obj = children->data;
+		} else if(gtk_widget_has_focus(inner_box) || (children != NULL && children->data != NULL)) {
+			gpointer obj = children != NULL ? children->data : NULL;
 
 			if(obj != NULL) {
 				GtkWidget* exp = gtk_bin_get_child(GTK_BIN(obj));
@@ -2007,7 +2351,6 @@ void wofi_init(struct map* _config) {
 		fprintf(stderr, "Do you actually have a monitor big enough to see this O_o? Dimensions can be no larger than %ux%u\n", UINT16_MAX, UINT16_MAX);
 		wofi_exit(1);
 	}
-
 	x = map_get(config, "x");
 	y = map_get(config, "y");
 	bool normal_window = strcmp(config_get(config, "normal_window", "false"), "true") == 0;
@@ -2034,6 +2377,20 @@ void wofi_init(struct map* _config) {
 	bool hide_scroll = strcmp(config_get(config, "hide_scroll", "false"), "true") == 0;
 	matching = config_get_mnemonic(config, "matching", "contains", 3, "contains", "multi-contains", "fuzzy");
 	insensitive = strcmp(config_get(config, "insensitive", "false"), "true") == 0;
+	{
+		size_t fs_max = (size_t) strtoul(config_get(config, "files_search_max_matches", "200"), NULL, 10);
+		if(fs_max == 0) {
+			fs_max = 200;
+		}
+		file_search_debounce_ms = strtoul(config_get(config, "files_search_debounce_ms", "120"), NULL, 10);
+		if(file_search_debounce_ms > 2000) {
+			file_search_debounce_ms = 2000;
+		}
+		/* 0 = update on every keystroke (can lag); default 120 ms batches GTK rebuilds */
+		files_search_configure(config_get(config, "files_search_extra_dirs", ""), insensitive, fs_max);
+	}
+	web_search_configure(config_get(config, "web_search_engine", "https://duckduckgo.com/?q=%s&ia=web"),
+			config_get(config, "web_browsers", "firefox,chromium"));
 	parse_search = strcmp(config_get(config, "parse_search", "false"), "true") == 0;
 	location = config_get_mnemonic(config, "location", "center", 18,
 			"center", "top_left", "top", "top_right", "right", "bottom_right", "bottom", "bottom_left", "left",
@@ -2296,6 +2653,8 @@ void wofi_init(struct map* _config) {
 	gtk_widget_set_name(entry, "input");
 	gtk_entry_set_placeholder_text(GTK_ENTRY(entry), prompt);
 
+	files_search_set_index_ready_callback(on_files_index_ready, NULL);
+
 	if(search != NULL) {
 		gtk_entry_set_text(GTK_ENTRY(entry), search);
 	}
@@ -2311,14 +2670,45 @@ void wofi_init(struct map* _config) {
 		gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_EXTERNAL, GTK_POLICY_EXTERNAL);
 	}
 
-	if (input_under_scroll == 1)
-	{
+	file_search_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+	gtk_widget_set_margin_start(file_search_bar, 6);
+	gtk_widget_set_margin_end(file_search_bar, 6);
+	gtk_widget_set_margin_top(file_search_bar, 4);
+	gtk_widget_set_margin_bottom(file_search_bar, 4);
+	gtk_widget_set_name(file_search_bar, "file-search-bar");
+	gtk_widget_set_no_show_all(file_search_bar, TRUE);
+
+	GtkWidget* file_lbl_type = gtk_label_new("Type");
+	gtk_widget_set_name(file_lbl_type, "file-search-label");
+	file_search_type_combo = gtk_combo_box_text_new();
+	gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(file_search_type_combo), "Files");
+	gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(file_search_type_combo), "Folders");
+	gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(file_search_type_combo), "Both");
+	gtk_combo_box_set_active(GTK_COMBO_BOX(file_search_type_combo), 0);
+	gtk_widget_set_name(file_search_type_combo, "file-search-type");
+
+	GtkWidget* file_lbl_ext = gtk_label_new("Ext");
+	gtk_widget_set_name(file_lbl_ext, "file-search-label");
+	file_search_ext_entry = gtk_entry_new();
+	gtk_entry_set_placeholder_text(GTK_ENTRY(file_search_ext_entry), ".c, .h …");
+	gtk_widget_set_hexpand(file_search_ext_entry, TRUE);
+	gtk_entry_set_max_length(GTK_ENTRY(file_search_ext_entry), 128);
+	gtk_widget_set_name(file_search_ext_entry, "file-search-ext");
+
+	gtk_box_pack_start(GTK_BOX(file_search_bar), file_lbl_type, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(file_search_bar), file_search_type_combo, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(file_search_bar), file_lbl_ext, FALSE, FALSE, 0);
+	gtk_box_pack_start(GTK_BOX(file_search_bar), file_search_ext_entry, TRUE, TRUE, 0);
+
+	gtk_widget_hide(file_search_bar);
+
+	if(input_under_scroll == 1) {
 		gtk_container_add(GTK_CONTAINER(outer_box), scroll);
+		gtk_container_add(GTK_CONTAINER(outer_box), file_search_bar);
 		gtk_container_add(GTK_CONTAINER(outer_box), entry);
-	}
-	else
-	{
+	} else {
 		gtk_container_add(GTK_CONTAINER(outer_box), entry);
+		gtk_container_add(GTK_CONTAINER(outer_box), file_search_bar);
 		gtk_container_add(GTK_CONTAINER(outer_box), scroll);
 	}
 
@@ -2344,6 +2734,8 @@ void wofi_init(struct map* _config) {
 	gtk_container_add(GTK_CONTAINER(inner_box), calc);
 	gtk_widget_hide(calc);
 
+	g_signal_connect(file_search_type_combo, "changed", G_CALLBACK(on_file_search_options_changed), NULL);
+	g_signal_connect(file_search_ext_entry, "changed", G_CALLBACK(on_file_search_options_changed), NULL);
 
 	g_signal_connect(inner_box, "child-activated", G_CALLBACK(activate_item), NULL);
 	g_signal_connect(inner_box, "selected-children-changed", G_CALLBACK(select_item), NULL);
